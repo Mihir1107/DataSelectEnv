@@ -78,16 +78,16 @@ tasks:
     description: >
       High noise (flip_y=0.25), budget=150, max_steps=12.
       Agent must reach performance > 0.52 while keeping average
-      noise selection rate below 0.30.
-    success_criteria: "current_performance > 0.52 AND avg_noise_ratio < 0.30"
+      noise selection rate below 0.50.
+    success_criteria: "current_performance > 0.52 AND avg_noise_ratio < 0.50"
 
   - id: hard
     difficulty: hard
     description: >
       High noise (flip_y=0.30), tight budget=100, max_steps=8.
-      Agent must hit performance > 0.53 efficiently.
+      Agent must hit performance > 0.58 efficiently.
       Grader scores performance and budget efficiency jointly.
-    success_criteria: "current_performance > 0.53, scored jointly with efficiency"
+    success_criteria: "current_performance > 0.58, scored jointly with efficiency"
 
 reward:
   type: continuous
@@ -98,6 +98,7 @@ reward:
     Provides dense signal throughout the episode — not just at termination.
 
 endpoints:
+  websocket: WS   /ws       # primary transport; required on HF Spaces
   reset:   POST /reset
   step:    POST /step
   state:   GET  /state

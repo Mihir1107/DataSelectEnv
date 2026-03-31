@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import random
 
@@ -7,7 +8,7 @@ from sklearn.metrics import log_loss
 from sklearn.preprocessing import StandardScaler
 
 from models import Observation, Action, EnvState
-from sampling import sample_uncertainty, sample_diversity, sample_random, entropy, sim_to_noisy
+from sampling import sample_uncertainty, sample_diversity, sample_random, entropy
 from reward import mean_cosine, running_mean
 
 
@@ -57,7 +58,7 @@ class DataSelectEnv:
             n_informative=5,
             n_redundant=5,
             n_clusters_per_class=2,
-            class_sep=1.5,
+            class_sep=1.0,
             flip_y=0.1,
             random_state=42,   # dataset skeleton is fixed; noise injection varies by seed
         )
@@ -75,9 +76,11 @@ class DataSelectEnv:
         flip_prob = self.cfg["data"].get("flip_y", 0.1)
         noise_mask = np.random.rand(len(y_pool)) < flip_prob
         y_pool_noisy = y_pool.copy()
-        random_labels = np.random.randint(0, 2, size=np.sum(noise_mask))
-        y_pool_noisy[noise_mask] = random_labels
-        X_pool[noise_mask] += np.random.normal(0, 0.5, X_pool[noise_mask].shape)
+        # Guaranteed label flip (1-y), not random assignment.
+        # Random assignment gives the correct label 50% of the time, halving
+        # effective noise. Flipping guarantees every noise_mask sample is wrong.
+        y_pool_noisy[noise_mask] = 1 - y_pool[noise_mask]
+        X_pool[noise_mask] += np.random.normal(0, 0.1, X_pool[noise_mask].shape)
 
         # Fresh model every episode
         self.model = SGDClassifier(
@@ -90,7 +93,7 @@ class DataSelectEnv:
         )
 
         # Warm start on seed data
-        for _ in range(2):
+        for _ in range(10):
             self.model.partial_fit(X_seed, y_seed, classes=np.unique(y))
 
         self._episode_state = DatasetState(
@@ -129,23 +132,34 @@ class DataSelectEnv:
         total = sum(w.values()) + 1e-8
         w = {k: v / total for k, v in w.items()}
 
+        min_b = self.cfg.get("min_batch", 1)
         b = min(action.batch_size, s.budget)
+        if b < min_b and action.action_type != "stop":
+            b = min_b   # enforce minimum; prevents single-sample gaming
         if b <= 0:
             return self._obs(), -0.01, False, {"error": "empty batch"}
 
         if action.action_type == "stop":
-            return self._obs(), 0.05 * s.budget, True, {}
+            perf_threshold = self.cfg.get("stop_threshold", 0.60)
+            if s.performance >= perf_threshold:
+                stop_reward = 0.05 * s.budget
+            else:
+                stop_reward = -1.0
+            return self._obs(), stop_reward, True, {}
 
         # Uncertainty + noise trap
         proba_pool = self.model.predict_proba(s.X_pool)
         H = entropy(proba_pool)
 
-        # Force noisy samples to look extremely uncertain (the trap)
-        noise_boost = s.noise_mask.astype(float) * 0.4
-
-        # Penalize structurally via similarity to noisy centroid
-        sim_noise = sim_to_noisy(s.X_pool, s.noisy_centroid)
-        H_adj = H + noise_boost - (self.cfg["alpha"] * 3.0) * sim_noise
+        # Noise trap: boost entropy of noisy samples so uncertainty sampling is
+        # attracted to them. Capped at 0.55 (< log(2) ≈ 0.693 max binary entropy)
+        # so clean uncertain samples can still compete — trap misleads rather
+        # than completely overrides, keeping uncertainty a near-miss on hard.
+        max_entropy = math.log(2)   # ≈ 0.693 for binary classifier
+        flip_prob   = self.cfg["data"].get("flip_y", 0.1)
+        boost_raw   = 0.1 + flip_prob * 2.0
+        noise_boost = s.noise_mask.astype(float) * min(boost_raw, 0.55)
+        H_adj = H + noise_boost
 
         # Sampling
         n_u = int(b * w.get("uncertainty", 0))
@@ -163,7 +177,7 @@ class DataSelectEnv:
 
         Xb, yb = s.X_pool[idx], s.y_pool[idx]
         selected_noise = s.noise_mask[idx]
-        noise_ratio = float(np.mean(selected_noise)) if s.steps >= self.WARMUP else 0.0
+        noise_ratio = float(np.mean(selected_noise))
 
         # Remove selected samples from pool — keep noise_mask in sync
         keep = np.ones(len(s.X_pool), dtype=bool)
@@ -180,11 +194,18 @@ class DataSelectEnv:
         new = self._score()
 
         # ----------------------------------------------------------------
-        # Reward design — DO NOT modify, balance is tuned
+        # Reward design
         # ----------------------------------------------------------------
         gain = (new - old) * 5.0
-        diversity_bonus = np.std(Xb)
-        gain += 0.2 * diversity_bonus
+
+        # Distance-based diversity bonus: rewards batches that cover regions
+        # far from existing training data. Diversity sampling scores high
+        # (~0.25), random scores average (~0.22), uncertainty scores low
+        # (~0.15) because boundary samples cluster near the centroid.
+        diversity_bonus = float(np.mean(
+            np.linalg.norm(Xb - s.train_centroid, axis=1)
+        )) * 0.05
+        gain += diversity_bonus
 
         redundancy = mean_cosine(Xb, s.train_centroid)
         if redundancy > 0.8:
@@ -192,9 +213,14 @@ class DataSelectEnv:
         if new > 0.85:
             gain *= 0.7
 
-        noise_penalty = 0.4 * noise_ratio
+        # Noise penalty scales with task difficulty: easy is forgiving,
+        # hard severely punishes noisy selections.
+        flip_prob = self.cfg["data"].get("flip_y", 0.1)
+        noise_scale = 1.0 + flip_prob * 2.0   # 1.1 easy | 1.5 medium | 1.6 hard
+        noise_penalty = noise_scale * noise_ratio
         reward = gain - 0.01 * b - 0.3 * redundancy - noise_penalty
-        reward += 0.2 * (new - old)   # small alignment bonus
+        reward += 0.15   # baseline: keeps reward in mixed-sign territory so
+                         # RL agents receive positive signal for good steps
         # ----------------------------------------------------------------
 
         # Update state

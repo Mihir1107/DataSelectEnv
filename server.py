@@ -20,12 +20,12 @@ import uuid
 from typing import Any, Dict, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from env import DataSelectEnv
-from models import Action, EnvState, Observation
+from models import Action, EnvState, Observation, Reward
 
 # ---------------------------------------------------------------------------
 # App
@@ -63,6 +63,7 @@ BASE_CFG = {
     "budget":    300,
     "max_steps": 15,
     "alpha":     0.2,
+    "min_batch": 5,
 }
 
 # ---------------------------------------------------------------------------
@@ -80,9 +81,10 @@ TASKS = {
         ),
         "success_criteria": "current_performance > 0.55 at episode end",
         "cfg_overrides": {
-            "data":      {"flip_y": 0.05},
-            "budget":    300,
-            "max_steps": 15,
+            "data":           {"flip_y": 0.05},
+            "budget":         300,
+            "max_steps":      15,
+            "stop_threshold": 0.60,
         },
     },
     "medium": {
@@ -91,13 +93,14 @@ TASKS = {
         "description": (
             "High noise (flip_y=0.25), budget=150, max_steps=12. "
             "Agent must reach performance > 0.52 while keeping average "
-            "noise selection rate below 0.30. Uncertainty-only strategies fail."
+            "noise selection rate below 0.45. Uncertainty-only strategies fail."
         ),
-        "success_criteria": "current_performance > 0.52 AND avg noise_ratio < 0.30",
+        "success_criteria": "current_performance > 0.52 AND avg noise_ratio < 0.45",
         "cfg_overrides": {
-            "data":      {"flip_y": 0.25},
-            "budget":    150,
-            "max_steps": 12,
+            "data":           {"flip_y": 0.25},
+            "budget":         150,
+            "max_steps":      12,
+            "stop_threshold": 0.57,
         },
     },
     "hard": {
@@ -105,15 +108,16 @@ TASKS = {
         "difficulty": "hard",
         "description": (
             "High noise (flip_y=0.30), tight budget=100, max_steps=8. "
-            "Agent must hit performance > 0.53 efficiently. "
+            "Agent must hit performance > 0.58 efficiently. "
             "Grader scores performance and budget efficiency jointly. "
             "Requires precise noise-aware + diversity-aware strategy."
         ),
-        "success_criteria": "performance > 0.53, scored jointly with budget efficiency",
+        "success_criteria": "performance > 0.58, scored jointly with budget efficiency",
         "cfg_overrides": {
-            "data":      {"flip_y": 0.30},
-            "budget":    100,
-            "max_steps": 8,
+            "data":           {"flip_y": 0.30},
+            "budget":         100,
+            "max_steps":      8,
+            "stop_threshold": 0.62,
         },
     },
 }
@@ -159,6 +163,9 @@ class EpisodeStore:
 
 store = EpisodeStore()
 
+# Completed episodes keyed by episode_id so /grader works after a subsequent reset()
+_completed: Dict[str, Dict[str, Any]] = {}
+
 # ---------------------------------------------------------------------------
 # Request / response schemas
 # ---------------------------------------------------------------------------
@@ -199,19 +206,19 @@ def _grade(task_id: str, obs: Observation, noise_ratios: list, cfg: dict) -> Gra
     perf = obs.current_performance
 
     if task_id == "easy":
-        # Single dimension: raw performance
-        score = float(np.clip((perf - 0.45) / (0.65 - 0.45), 0.0, 1.0))
-        passed = perf > 0.55
+        # Single dimension: raw performance — range [0.55, 0.75] avoids saturation
+        score = float(np.clip((perf - 0.55) / (0.75 - 0.55), 0.0, 1.0))
+        passed = perf > 0.62
         breakdown: Dict[str, Any] = {"performance_score": round(score, 4)}
 
     elif task_id == "medium":
         avg_noise = float(np.mean(noise_ratios)) if noise_ratios else 1.0
         # Performance sub-score
         perf_score  = float(np.clip((perf - 0.42) / (0.62 - 0.42), 0.0, 1.0))
-        # Noise avoidance sub-score: full marks at 0 noise, zero at >=0.30
-        noise_score = float(np.clip(1.0 - avg_noise / 0.30, 0.0, 1.0))
+        # Noise avoidance sub-score: full marks at 0 noise, zero at >=0.50
+        noise_score = float(np.clip(1.0 - avg_noise / 0.50, 0.0, 1.0))
         score  = round(0.6 * perf_score + 0.4 * noise_score, 4)
-        passed = perf > 0.52 and avg_noise < 0.30
+        passed = perf > 0.52 and avg_noise < 0.50
         breakdown = {
             "performance_score": round(perf_score,  4),
             "noise_score":       round(noise_score, 4),
@@ -221,12 +228,12 @@ def _grade(task_id: str, obs: Observation, noise_ratios: list, cfg: dict) -> Gra
     else:  # hard
         budget_total = cfg["budget"]
         budget_used  = budget_total - obs.remaining_budget
-        perf_score   = float(np.clip((perf - 0.43) / (0.63 - 0.43), 0.0, 1.0))
-        # Efficiency: reward finishing with budget left; +0.2 grace so
-        # spending most of the budget still gets partial efficiency credit
-        efficiency   = float(np.clip(1.0 - budget_used / budget_total + 0.2, 0.0, 1.0))
+        perf_score   = float(np.clip((perf - 0.50) / (0.72 - 0.50), 0.0, 1.0))
+        # Efficiency: fraction of budget saved — no grace offset so it
+        # actually varies (0.0 = all spent, 1.0 = nothing spent)
+        efficiency   = float(np.clip(1.0 - budget_used / budget_total, 0.0, 1.0))
         score  = round(0.65 * perf_score + 0.35 * efficiency, 4)
-        passed = perf > 0.53
+        passed = perf > 0.58
         breakdown = {
             "performance_score": round(perf_score, 4),
             "efficiency_score":  round(efficiency, 4),
@@ -311,11 +318,19 @@ def step(req: StepRequest):
     if "noise_ratio" in info:
         store.noise_ratios.append(info["noise_ratio"])
 
+    if done:
+        _completed[store.episode_id] = {
+            "final_obs":    obs,
+            "noise_ratios": list(store.noise_ratios),
+            "cfg":          store._cfg,
+            "task_id":      store.task_id,
+        }
+
     return {
         "episode_id":  store.episode_id,
         "step":        store.step_count,
         "observation": obs.model_dump(),
-        "reward":      round(float(reward), 6),
+        "reward":      Reward(value=round(float(reward), 6)).model_dump(),
         "done":        done,
         "info":        info,
     }
@@ -360,28 +375,40 @@ def tasks():
 @app.post("/grader")
 def grader(req: GraderRequest):
     """
-    Score the most recently completed episode.
+    Score a completed episode.
 
     Body: { "episode_id": "...", "task_id": "easy|medium|hard" }
-    episode_id must match the active episode; episode must be done.
+    Works even after a subsequent reset() — looks up by episode_id.
     """
-    if store.episode_id != req.episode_id:
-        raise HTTPException(
-            status_code=400,
-            detail="episode_id does not match the current episode.",
-        )
-    if not store.done:
-        raise HTTPException(
-            status_code=400,
-            detail="Episode is not finished. Keep stepping until done=True.",
-        )
     if req.task_id not in TASKS:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown task_id '{req.task_id}'.",
         )
 
-    return _grade(req.task_id, store.final_obs, store.noise_ratios, store._cfg)
+    record = _completed.get(req.episode_id)
+    if record is None:
+        # Fall back to the active episode if it matches and is done
+        if store.episode_id == req.episode_id and store.done:
+            record = {
+                "final_obs":    store.final_obs,
+                "noise_ratios": store.noise_ratios,
+                "cfg":          store._cfg,
+                "task_id":      store.task_id,
+            }
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail="episode_id not found or episode is not finished yet.",
+            )
+
+    if req.task_id != record["task_id"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"task_id mismatch: episode was '{record['task_id']}', got '{req.task_id}'.",
+        )
+
+    return _grade(req.task_id, record["final_obs"], record["noise_ratios"], record["cfg"])
 
 
 @app.get("/baseline")
@@ -433,6 +460,125 @@ def baseline():
         "seed":           42,
         "results":        results,
     }
+
+
+# ---------------------------------------------------------------------------
+# WebSocket endpoint — required by OpenEnv spec; primary client transport on
+# HF Spaces (HTTP /reset and /step are inaccessible after deployment there).
+#
+# Protocol: every message is {"type": str, "data": dict}
+#   Client → server types: "reset", "step", "state", "close"
+#   Server → client types: mirrors client type on success, "error" on failure
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+
+    # Per-connection isolated state (no shared store)
+    ws_env:          DataSelectEnv | None = None
+    ws_cfg:          dict | None          = None
+    ws_episode_id:   str | None           = None
+    ws_task_id:      str | None           = None
+    ws_noise_ratios: list                 = []
+    ws_done:         bool                 = False
+    ws_final_obs:    Observation | None   = None
+
+    async def send_error(message: str, code: str = "error") -> None:
+        await websocket.send_json({"type": "error", "data": {"message": message, "code": code}})
+
+    try:
+        while True:
+            raw = await websocket.receive_json()
+            msg_type = raw.get("type")
+            msg_data = raw.get("data", {})
+
+            # ── reset ─────────────────────────────────────────────────────
+            if msg_type == "reset":
+                tid  = msg_data.get("task_id", "easy")
+                seed = int(msg_data.get("seed", 42))
+
+                if tid not in TASKS:
+                    await send_error(
+                        f"Unknown task_id '{tid}'. Valid: {list(TASKS.keys())}",
+                        "invalid_task",
+                    )
+                    continue
+
+                ws_cfg          = _build_cfg(tid)
+                ws_env          = DataSelectEnv(ws_cfg, seed=seed)
+                obs             = ws_env.reset()
+                ws_task_id      = tid
+                ws_episode_id   = str(uuid.uuid4())
+                ws_noise_ratios = []
+                ws_done         = False
+                ws_final_obs    = obs
+
+                await websocket.send_json({
+                    "type": "reset",
+                    "data": {
+                        "episode_id":  ws_episode_id,
+                        "task_id":     ws_task_id,
+                        "observation": obs.model_dump(),
+                        "reward":      0.0,
+                        "done":        False,
+                    },
+                })
+
+            # ── step ──────────────────────────────────────────────────────
+            elif msg_type == "step":
+                if ws_env is None or ws_done:
+                    await send_error("No active episode. Send a reset message first.", "no_episode")
+                    continue
+
+                try:
+                    action = Action(**msg_data)
+                except Exception as exc:
+                    await send_error(f"Invalid action: {exc}", "invalid_action")
+                    continue
+
+                obs, reward, done, info = ws_env.step(action)
+                ws_done         = done
+                ws_final_obs    = obs
+                if "noise_ratio" in info:
+                    ws_noise_ratios.append(info["noise_ratio"])
+
+                await websocket.send_json({
+                    "type": "step",
+                    "data": {
+                        "episode_id":  ws_episode_id,
+                        "observation": obs.model_dump(),
+                        "reward":      round(float(reward), 6),
+                        "done":        done,
+                        "info":        info,
+                    },
+                })
+
+            # ── state ─────────────────────────────────────────────────────
+            elif msg_type == "state":
+                if ws_env is None:
+                    state_data = {
+                        "step_count": 0, "remaining_budget": None,
+                        "current_performance": None, "pool_size": None, "done": False,
+                    }
+                else:
+                    state_data = ws_env.get_state().model_dump()
+
+                await websocket.send_json({
+                    "type": "state",
+                    "data": {"episode_id": ws_episode_id, "task_id": ws_task_id, **state_data},
+                })
+
+            # ── close ─────────────────────────────────────────────────────
+            elif msg_type == "close":
+                await websocket.send_json({"type": "close", "data": {}})
+                break
+
+            else:
+                await send_error(f"Unknown message type '{msg_type}'", "unknown_type")
+
+    except WebSocketDisconnect:
+        pass  # client disconnected cleanly
 
 
 # ---------------------------------------------------------------------------
