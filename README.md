@@ -49,28 +49,29 @@ Strategy weights are normalised internally and do not need to sum to 1.
 
 | Name | flip_y | Budget | max_steps | Success criteria | Expected random score |
 |---|---|---|---|---|---|
-| `easy` | 0.05 | 300 | 15 | performance > 0.55 | ~0.60 |
-| `medium` | 0.25 | 150 | 12 | performance > 0.52 AND avg noise ratio < 0.30 | ~0.40 |
-| `hard` | 0.30 | 100 | 8 | performance > 0.53 (+ budget efficiency) | ~0.30 |
+| `easy` | 0.05 | 300 | 15 | performance > 0.62 | ~0.60 |
+| `medium` | 0.25 | 150 | 12 | performance > 0.52 AND avg noise ratio < 0.50 | ~0.40 |
+| `hard` | 0.30 | 100 | 8 | performance > 0.58 (scored jointly with budget efficiency) | ~0.30 |
 
 ---
 
 ## Reward Function
 
 ```
-gain        = (new_performance - old_performance) * 5.0
-            + 0.2 * std(selected_batch)            # diversity bonus
-            + 0.2 * (new_performance - old_performance)  # alignment bonus
+gain          = (new_performance - old_performance) * 5.0
+              + mean(||selected_batch - train_centroid||) * 0.05   # diversity bonus
 
-if redundancy > 0.8:  gain *= 0.5   # redundancy penalty
+if redundancy > 0.8:  gain *= 0.5    # redundancy penalty
 if new_performance > 0.85: gain *= 0.7  # diminishing-returns cap
 
-noise_penalty = 0.4 * noise_ratio_of_selected_batch
+noise_scale   = 1.0 + flip_y * 2.0  # 1.1 easy | 1.5 medium | 1.6 hard
+noise_penalty = noise_scale * noise_ratio_of_selected_batch
 
 reward = gain
-       - 0.01 * batch_size       # budget cost
-       - 0.3  * redundancy       # cosine similarity to training centroid
+       - 0.01 * batch_size    # budget cost
+       - 0.3  * redundancy    # cosine similarity to training centroid
        - noise_penalty
+       + 0.15                  # baseline offset (keeps signal in mixed-sign territory)
 ```
 
 ---
@@ -131,4 +132,3 @@ Scores below are from the fixed balanced agent (`uncertainty=0.4, diversity=0.4,
 | medium | 0.6600 | ✅ | 0.6569 |
 | hard | 0.4174 | ✅ | 0.6176 |
 
-Scores are from the fixed balanced agent (`uncertainty=0.4, diversity=0.4, random=0.2`, seed=42) via `GET /baseline`.
