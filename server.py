@@ -259,7 +259,7 @@ def health():
 
 
 @app.post("/reset")
-def reset(req: ResetRequest):
+def reset(req: Optional[ResetRequest] = None):
     """
     Start a new episode.
 
@@ -267,6 +267,8 @@ def reset(req: ResetRequest):
       seed    (int, default 42)    — RNG seed for full reproducibility
       task_id (str, default 'easy') — one of: easy | medium | hard
     """
+    if req is None:
+        req = ResetRequest()
     if req.task_id not in TASKS:
         raise HTTPException(
             status_code=400,
