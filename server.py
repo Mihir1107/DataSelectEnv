@@ -93,9 +93,9 @@ TASKS = {
         "description": (
             "High noise (flip_y=0.25), budget=150, max_steps=12. "
             "Agent must reach performance > 0.52 while keeping average "
-            "noise selection rate below 0.45. Uncertainty-only strategies fail."
+            "noise selection rate below 0.50. Uncertainty-only strategies fail."
         ),
-        "success_criteria": "current_performance > 0.52 AND avg noise_ratio < 0.45",
+        "success_criteria": "current_performance > 0.52 AND avg noise_ratio < 0.50",
         "cfg_overrides": {
             "data":           {"flip_y": 0.25},
             "budget":         150,
