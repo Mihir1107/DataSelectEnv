@@ -262,7 +262,18 @@ def main() -> None:
         print("ERROR: Set HF_TOKEN or OPENAI_API_KEY environment variable.")
         sys.exit(1)
 
-    client = OpenAI(api_key=api_key, base_url=API_BASE_URL)
+    # Normalize base_url: ensure it's non-empty and ends without trailing slash
+    base_url = (API_BASE_URL or "").strip().rstrip("/") or "https://api.openai.com/v1"
+
+    try:
+        client = OpenAI(api_key=api_key, base_url=base_url)
+    except Exception as e:
+        print(f"WARNING: OpenAI init with base_url failed ({e}), retrying without base_url")
+        try:
+            client = OpenAI(api_key=api_key)
+        except Exception as e2:
+            print(f"ERROR: Could not initialize LLM client: {e2}")
+            sys.exit(1)
 
     # Health check over HTTP
     try:
