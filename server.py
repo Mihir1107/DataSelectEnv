@@ -240,6 +240,9 @@ def _grade(task_id: str, obs: Observation, noise_ratios: list, cfg: dict) -> Gra
             "budget_used":       int(budget_used),
         }
 
+    # Validator requires score strictly in (0, 1) — clamp away from exact endpoints
+    score = float(np.clip(score, 0.001, 0.999))
+
     return GraderResponse(
         episode_id=store.episode_id,
         task_id=task_id,
