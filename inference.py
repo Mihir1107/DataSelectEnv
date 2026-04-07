@@ -24,7 +24,6 @@ import sys
 
 import requests
 import websockets
-from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # Config — all overridable via environment variables
@@ -35,11 +34,6 @@ API_BASE_URL  = os.environ.get("API_BASE_URL",  "https://api.openai.com/v1")
 MODEL_NAME    = os.environ.get("MODEL_NAME",    "gpt-4o-mini")
 SEED          = 42
 TASKS         = ["easy", "medium", "hard"]
-FALLBACK_ACTION = {
-    "action_type": "select_batch",
-    "batch_size": 10,
-    "strategy_weights": {"uncertainty": 0.3, "diversity": 0.5, "random": 0.2},
-}
 
 SYSTEM_PROMPT = """You are an intelligent data curation agent.
 
@@ -57,51 +51,111 @@ Observation fields:
 Respond with ONLY a valid JSON action in this exact format:
 {
   "action_type": "select_batch",
-  "batch_size": <integer 5–20>,
+  "batch_size": <integer 5-20>,
   "strategy_weights": {
-    "uncertainty": <float 0–1>,
-    "diversity":   <float 0–1>,
-    "random":      <float 0–1>
+    "uncertainty": <float 0-1>,
+    "diversity":   <float 0-1>,
+    "random":      <float 0-1>
   }
 }
 
 Strategy rules:
 - Weights are normalized automatically (no need to sum to 1)
-- noise_estimate > 0.2  → lower uncertainty weight, raise diversity weight
-- noise_estimate > 0.4  → set uncertainty near 0, maximize diversity
-- diversity_score < 0.5 → increase diversity weight
-- remaining_budget < 30 → reduce batch_size to 5
+- noise_estimate > 0.2  -> lower uncertainty weight, raise diversity weight
+- noise_estimate > 0.4  -> set uncertainty near 0, maximize diversity
+- diversity_score < 0.5 -> increase diversity weight
+- remaining_budget < 30 -> reduce batch_size to 5
 - You may use "action_type": "stop" with batch_size 0 only when
   current_performance > 0.65 AND remaining_budget < 20
 - Respond with ONLY the JSON object, no explanation, no markdown fences."""
 
 
 # ---------------------------------------------------------------------------
-# LLM helper
+# Rule-based fallback (used when LLM is unavailable or errors)
 # ---------------------------------------------------------------------------
 
-def query_llm(client: OpenAI, observation: dict) -> dict:
-    """Ask the LLM to produce an action given the current observation."""
+def rule_based_action(obs: dict) -> dict:
+    """Produce a sensible action from the observation without an LLM."""
+    noise      = obs.get("noise_estimate", 0.1)
+    diversity  = obs.get("diversity_score", 1.0)
+    budget     = obs.get("remaining_budget", 100)
+    perf       = obs.get("current_performance", 0.5)
+    available  = obs.get("samples_available", 100)
+
+    # Batch size: shrink near budget exhaustion
+    batch_size = 5 if budget < 30 else 10
+
+    # Weights: penalize uncertainty when noise is high
+    if noise > 0.4:
+        u, d, r = 0.05, 0.80, 0.15
+    elif noise > 0.2:
+        u, d, r = 0.20, 0.60, 0.20
+    elif diversity < 0.5:
+        u, d, r = 0.30, 0.55, 0.15
+    else:
+        u, d, r = 0.40, 0.40, 0.20
+
+    # Early stop if doing well and nearly out of budget
+    if perf > 0.65 and budget < 20 and available > 0:
+        return {"action_type": "stop", "batch_size": 0,
+                "strategy_weights": {"uncertainty": u, "diversity": d, "random": r}}
+
+    return {
+        "action_type": "select_batch",
+        "batch_size": batch_size,
+        "strategy_weights": {"uncertainty": u, "diversity": d, "random": r},
+    }
+
+
+# ---------------------------------------------------------------------------
+# LLM helper — uses requests directly (no openai SDK dependency)
+# ---------------------------------------------------------------------------
+
+def query_llm(api_key: str | None, obs: dict) -> dict:
+    """
+    Call the LLM via plain HTTP (OpenAI-compatible chat/completions endpoint).
+    Returns a parsed action dict. Raises on any error so the caller can
+    fall back to rule_based_action.
+    """
+    if not api_key:
+        raise ValueError("No API key available")
+
+    base_url = (API_BASE_URL or "https://api.openai.com/v1").rstrip("/")
+    url = f"{base_url}/chat/completions"
+
     user_msg = (
-        f"Current observation:\n{json.dumps(observation, indent=2)}\n\n"
+        f"Current observation:\n{json.dumps(obs, indent=2)}\n\n"
         "What action do you take?"
     )
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": user_msg},
         ],
-        temperature=0.0,
-        max_tokens=200,
-    )
-    raw = response.choices[0].message.content.strip()
+        "temperature": 0.0,
+        "max_tokens": 200,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    resp = requests.post(url, json=payload, headers=headers, timeout=30)
+    resp.raise_for_status()
+    raw = resp.json()["choices"][0]["message"]["content"].strip()
+
     # Strip markdown fences if model wraps JSON
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
-    return json.loads(raw.strip())
+
+    action = json.loads(raw.strip())
+    assert "action_type" in action
+    assert "batch_size"  in action
+    assert "strategy_weights" in action
+    return action
 
 
 # ---------------------------------------------------------------------------
@@ -109,12 +163,10 @@ def query_llm(client: OpenAI, observation: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def http_base(host: str) -> str:
-    """Return HTTP base URL (strip trailing slash)."""
     return host.rstrip("/")
 
 
 def ws_url(host: str) -> str:
-    """Convert http(s):// base URL to ws(s):// WebSocket URL."""
     base = http_base(host)
     if base.startswith("https://"):
         return "wss://" + base[len("https://"):] + "/ws"
@@ -123,11 +175,8 @@ def ws_url(host: str) -> str:
     return base + "/ws"
 
 
-async def run_task_ws(host: str, client: OpenAI, task_id: str) -> dict:
-    """
-    Run one full episode for task_id over a WebSocket connection.
-    Returns the grader result dict.
-    """
+async def run_task_ws(host: str, api_key: str | None, task_id: str) -> dict:
+    """Run one full episode for task_id over a WebSocket. Returns grader result."""
     print(f"\n{'='*52}")
     print(f"  Task: {task_id.upper()}")
     print(f"{'='*52}")
@@ -159,16 +208,12 @@ async def run_task_ws(host: str, client: OpenAI, task_id: str) -> dict:
         while not done:
             step += 1
 
-            # Get action from LLM (with fallback on parse error)
+            # Try LLM; fall back to rule-based on any failure
             try:
-                action = query_llm(client, obs)
-                # Validate required keys are present
-                assert "action_type" in action
-                assert "batch_size"  in action
-                assert "strategy_weights" in action
+                action = query_llm(api_key, obs)
             except Exception as e:
-                print(f"  Step {step}: LLM parse error ({e}), using fallback")
-                action = FALLBACK_ACTION
+                print(f"  Step {step}: LLM unavailable ({type(e).__name__}), using rule-based")
+                action = rule_based_action(obs)
 
             await ws.send(json.dumps({"type": "step", "data": action}))
             resp = json.loads(await ws.recv())
@@ -179,7 +224,6 @@ async def run_task_ws(host: str, client: OpenAI, task_id: str) -> dict:
 
             data         = resp["data"]
             obs          = data["observation"]
-            # reward is wrapped in {"value": float} per Reward model
             raw_reward   = data["reward"]
             reward       = raw_reward["value"] if isinstance(raw_reward, dict) else float(raw_reward)
             done         = data["done"]
@@ -202,7 +246,7 @@ async def run_task_ws(host: str, client: OpenAI, task_id: str) -> dict:
     print(f"\n  Episode done after {step} steps | total_reward={total_reward:.4f}")
     print(f"  Final performance: {obs['current_performance']:.4f}")
 
-    # ── grade via HTTP (grader endpoint doesn't need WebSocket) ──────────
+    # ── grade via HTTP ────────────────────────────────────────────────────
     r = requests.post(
         f"{http_base(host)}/grader",
         json={"episode_id": episode_id, "task_id": task_id},
@@ -230,10 +274,10 @@ async def run_task_ws(host: str, client: OpenAI, task_id: str) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
-async def amain(host: str, client: OpenAI) -> None:
+async def amain(host: str, api_key: str | None) -> None:
     results = {}
     for task_id in TASKS:
-        results[task_id] = await run_task_ws(host, client, task_id)
+        results[task_id] = await run_task_ws(host, api_key, task_id)
 
     print(f"\n{'='*52}")
     print("  INFERENCE RESULTS SUMMARY")
@@ -257,34 +301,23 @@ def main() -> None:
                         help="Environment server base URL (http or https)")
     args = parser.parse_args()
 
+    # API key is optional — rule-based fallback runs without one
     api_key = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("ERROR: Set HF_TOKEN or OPENAI_API_KEY environment variable.")
-        sys.exit(1)
+    if api_key:
+        print(f"LLM API key found ({len(api_key)} chars); will attempt LLM-guided actions.")
+    else:
+        print("No API key (HF_TOKEN / OPENAI_API_KEY); running rule-based fallback.")
 
-    # Normalize base_url: ensure it's non-empty and ends without trailing slash
-    base_url = (API_BASE_URL or "").strip().rstrip("/") or "https://api.openai.com/v1"
-
+    # Health check — environment must be reachable
     try:
-        client = OpenAI(api_key=api_key, base_url=base_url)
-    except Exception as e:
-        print(f"WARNING: OpenAI init with base_url failed ({e}), retrying without base_url")
-        try:
-            client = OpenAI(api_key=api_key)
-        except Exception as e2:
-            print(f"ERROR: Could not initialize LLM client: {e2}")
-            sys.exit(1)
-
-    # Health check over HTTP
-    try:
-        r = requests.get(f"{http_base(args.host)}/health", timeout=10)
+        r = requests.get(f"{http_base(args.host)}/health", timeout=15)
         r.raise_for_status()
         print(f"Connected to {args.host} — {r.json()}")
     except Exception as e:
         print(f"ERROR: Could not reach environment at {args.host}: {e}")
         sys.exit(1)
 
-    asyncio.run(amain(args.host, client))
+    asyncio.run(amain(args.host, api_key))
 
 
 if __name__ == "__main__":
