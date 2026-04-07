@@ -36,9 +36,10 @@ from openai import OpenAI
 # Config — all overridable via environment variables
 # ---------------------------------------------------------------------------
 
-DEFAULT_HOST  = os.environ.get("ENV_HOST",      "http://localhost:7860")
-API_BASE_URL  = os.environ.get("API_BASE_URL",  "https://router.huggingface.co/v1")
-MODEL_NAME    = os.environ.get("MODEL_NAME",    "meta-llama/Llama-3.1-8B-Instruct")
+DEFAULT_HOST  = os.environ.get("ENV_HOST", "http://localhost:7860")
+API_BASE_URL  = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME    = os.getenv("MODEL_NAME",   "meta-llama/Llama-3.1-8B-Instruct")
+HF_TOKEN      = os.getenv("HF_TOKEN")
 BENCHMARK     = "DataSelectEnv"
 SEED          = 42
 TASKS         = ["easy", "medium", "hard"]
@@ -145,14 +146,14 @@ def rule_based_action(obs: dict) -> dict:
 
 def make_openai_client(api_key: str) -> OpenAI:
     """
-    Create the required OpenAI client.
+    Create the required OpenAI client (as mandated by the spec).
     Uses an explicit httpx.Client with trust_env=False to bypass proxy
     auto-detection that commonly breaks SDK init in containerised environments.
     """
     base_url = (API_BASE_URL or "https://router.huggingface.co/v1").strip().rstrip("/")
     http_client = httpx.Client(trust_env=False)
     try:
-        return OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+        return OpenAI(base_url=base_url, api_key=api_key, http_client=http_client)
     except Exception:
         return OpenAI(api_key=api_key, http_client=http_client)
 
@@ -338,14 +339,13 @@ def main() -> None:
                         help="Environment server base URL (http or https)")
     args = parser.parse_args()
 
-    # Build OpenAI client (required by spec); warn and fall back if unavailable
-    api_key = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY")
+    # Build OpenAI client using HF_TOKEN (required by spec)
     client: Optional[OpenAI] = None
-    if not api_key:
-        print("WARNING: No HF_TOKEN / OPENAI_API_KEY found — using rule-based fallback.", flush=True)
+    if not HF_TOKEN:
+        print("WARNING: HF_TOKEN not set — using rule-based fallback.", flush=True)
     else:
         try:
-            client = make_openai_client(api_key)
+            client = make_openai_client(HF_TOKEN)
             print(f"OpenAI client ready | base_url={API_BASE_URL} | model={MODEL_NAME}", flush=True)
         except Exception as e:
             print(f"WARNING: Could not init OpenAI client ({e}); using rule-based fallback.", flush=True)
