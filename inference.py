@@ -99,10 +99,12 @@ def log_step(step: int, action: dict, reward: float, done: bool,
 
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    # Clamp score to (0.001, 0.999) strictly — validator rejects exact 0.0 or 1.0
+    score = max(0.001, min(0.999, score))
+    rewards_str = ",".join(f"{r:.4f}" for r in rewards)
     print(
         f"[END] success={str(success).lower()} steps={steps} "
-        f"score={score:.2f} rewards={rewards_str}",
+        f"score={score:.4f} rewards={rewards_str}",
         flush=True,
     )
 
